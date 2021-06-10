@@ -1,0 +1,128 @@
+# GitHub Action for Laravel with MySQL and Redis
+name: Testing Laravel with MySQL
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ '**' ]
+jobs:
+  laravel:
+    name: Laravel (PHP ${{ matrix.php-versions }})
+    runs-on: ubuntu-latest
+    env:
+      DB_DATABASE: laravel
+      DB_USERNAME: root
+      DB_PASSWORD: password
+      BROADCAST_DRIVER: log
+      CACHE_DRIVER: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: false
+          MYSQL_ROOT_PASSWORD: password
+          MYSQL_DATABASE: laravel
+        ports:
+          - 3306/tcp
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+      redis:
+        image: redis
+        ports:
+          - 6379/tcp
+        options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: [ '7.4' ]
+    steps:
+      -   name: Checkout
+          uses: actions/checkout@v2
+      -   name: Setup PHP, with composer and extensions
+          uses: shivammathur/setup-php@v2 #https://github.com/shivammathur/setup-php
+          with:
+            php-version: ${{ matrix.php-versions }}
+            extensions: mbstring, dom, fileinfo, mysql
+            coverage: xdebug #optional
+      -   name: Start mysql service
+          run: sudo /etc/init.d/mysql start
+      -   name: Get composer cache directory
+          id: composer-cache
+          run: echo "::set-output name=dir::$(composer config cache-files-dir)"
+      -   name: Cache composer dependencies
+          uses: actions/cache@v2
+          with:
+            path: ${{ steps.composer-cache.outputs.dir }}
+            # Use composer.json for key, if composer.lock is not committed.
+            # key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
+            key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+            restore-keys: ${{ runner.os }}-composer-
+      -   name: Install Composer dependencies
+          run: composer install --no-progress --prefer-dist --optimize-autoloader
+      -   name: Check for composer security issues
+          run: composer update --dry-run roave/security-advisories
+      -   name: Install npm dependencies
+          run: npm ci
+      -   name: Check npm vulnerabilities
+          run: npm audit --audit-level=critical --only=prod
+      -   name: Build npm
+          run: npm run dev
+      -   name: Prepare the application
+          run: |
+            php -r "copy('.env.atj.travis', '.env');"
+      #                    php -r "file_exists('.env') || copy('.env.example', '.env');"
+      #                    php artisan key:generate
+      -   name: Run Migration
+          run: php artisan migrate:fresh --schema-path=database/schema/main-schema.dump
+      -   name: Seed static data
+          run: php artisan db:seed --class=StaticDataSeeder
+      -   name: Seed
+          run: php artisan db:seed
+      -   name: Seed wordpress
+          run: php artisan db:seed --class=WordpressSeeder
+      -   name: Migrate intranet
+          run: php artisan migrate --path=database/migrations/ci
+      -   name: Seed intranet
+          run: php artisan db:seed --database=intranet --class=IntranetSeeder
+      -   name: Generate key
+          run: php artisan key:generate
+      -   name: Generate passport keys
+          run: php artisan passport:keys
+      -   name: Update chromedriver
+          run: php artisan dusk:chrome-driver --detect
+      -   name: Run chrome
+          run: google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 http://localhost:8000 >/dev/null 2>&1 &
+      -   name: Run server
+          run: php artisan serve --no-reload -q >/dev/null 2>&1 &
+      -   name: Clear Config
+          run: php artisan config:clear
+      -   name: Clear cache
+          run: php artisan cache:clear
+      -   name: Clear views
+          run: php artisan view:clear
+      -   name: Clear routes
+          run: php artisan route:clear
+      -   name: Generate route patterns
+          run: php artisan route:generate_patterns
+          env:
+            DB_PORT: ${{ job.services.mysql.ports['3306'] }}
+            REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
+      -   name: Run phpcs
+          run: vendor/bin/phpcs -n
+      -   name: Run js linter
+          run: npm run lint-js -- --quiet
+      -   name: Run phpunit tests
+          run: vendor/bin/phpunit
+      -   name: Run psalm
+          run: vendor/bin/psalm --memory-limit=3G
+      -   name: Run phpstan
+          run: vendor/bin/phpstan analyse --memory-limit=3G
+      -   name: Run dusk tests
+          run: php artisan dusk --group=ci-core
+      -   name: Send dusk emails
+          if: ${{ failure() }}
+          run: php artisan email:dusk_failure
+          env:
+            DB_PORT: ${{ job.services.mysql.ports['3306'] }}
+            REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
